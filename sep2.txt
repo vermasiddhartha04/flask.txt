@@ -1,0 +1,166 @@
+from flask import Flask, request, render_template, redirect, session, jsonify
+from flask_sqlalchemy import SQLAlchemy
+import bcrypt
+from flask_jwt_extended import create_access_token, JWTManager, jwt_required, get_jwt_identity
+from middleware import auth, guest
+from flask_migrate import Migrate
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///database.db'
+db = SQLAlchemy(app)
+app.secret_key = 'secret_key'
+jwt = JWTManager(app)
+migrate = Migrate(app, db)
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    email = db.Column(db.String(100), unique=True, nullable=False)
+    password = db.Column(db.String(100), nullable=False)
+    roles = db.relationship('Role', secondary='role_mapping', back_populates='users')
+    
+    def __init__(self, name, email, password):
+        self.name = name
+        self.email = email
+        self.password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "email": self.email
+        }
+
+    def check_password(self, password):
+        return bcrypt.checkpw(password.encode('utf-8'), self.password.encode('utf-8'))
+
+
+class Role(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), unique=True, nullable=False)
+    users = db.relationship('User', secondary='role_mapping', back_populates='roles')
+
+    def __init__(self, name):
+        self.name = name
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name
+        }
+
+class RoleMapping(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    role_id = db.Column(db.Integer, db.ForeignKey('role.id'), nullable=False)
+
+    # Correct the relationship
+    user = db.relationship('User', backref=db.backref('role_mappings', cascade='all, delete-orphan'))
+    role = db.relationship('Role', backref=db.backref('role_mappings', cascade='all, delete-orphan'))
+
+    def __init__(self, user_id, role_id):
+        self.user_id = user_id
+        self.role_id = role_id
+
+
+with app.app_context():
+    db.create_all()
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        try:
+            name = request.form.get('name')
+            email = request.form.get('email')
+            password = request.form.get('password')
+            role = request.form.get('role')
+
+            if not name or not email or not password or not role:
+                return {'message': "All fields are required"}, 400
+            if role.lower() not in ['admin','user','guest']:
+                return {'message': "invalid role"}
+            role_id = Role.query.filter(Role.name==role.lower())
+            
+            new_user = User(email=email,password=password,name=name,role_id=role_id)
+            #how can we get db generated id to use in role maping without commit
+            
+            new_role_mapping=RoleMapping(user_id=new_user.id,role_id=role_id)
+
+            db.session.add(new_user)
+            db.session.add(new_role_mapping)
+            db.session.commit()
+            # (Rest of your registration logic)
+            
+        except Exception as e:
+            logging.error(f"Error during registration: {str(e)}")
+            return {'message': "An error occurred"}, 500
+
+    return render_template('register.html')
+
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+
+        user = User.query.filter_by(email=email).first()
+        
+        if user and user.check_password(password):
+            role_mapping = RoleMapping.query.filter_by(user_id=user.id).first()
+            role = Role.query.get(role_mapping.role_id) if role_mapping else None
+            access_token = create_access_token(identity={'id': user.id, 'name': user.name, 'role': role.name if role else None})
+            return {'access_token': access_token}, 200
+        
+        return {'message': 'invalid credentials'}, 401
+
+@app.route('/dashboard')
+@jwt_required()
+def dashboard():
+    curr_user_id = get_jwt_identity()
+    user = User.query.filter_by(id=curr_user_id['id']).first()
+    return render_template('dashboard.html', user=user)
+
+@app.route('/logout')
+@auth
+def logout():
+    session.pop('email', None)
+    return redirect('/login')
+
+@app.route('/add-new-post')
+@jwt_required()
+def add_new_post():
+    curr_user_id = get_jwt_identity()
+    # Logic to add a new post (need to define the Post model and data handling)
+    return jsonify({"message": "New post added"})
+
+@app.route('/change-role/<int:user_id>', methods=['POST'])
+@jwt_required()
+def change_role(user_id):
+    current_user = get_jwt_identity()
+    if current_user['role'] != 'admin':
+        return {'message': 'Admin access required'}, 403
+
+    user = User.query.get(user_id)
+    if not user:
+        return {'message': 'User not found'}, 404
+
+    new_role_id = request.json.get('role_id')
+    role = Role.query.get(new_role_id)
+    if not role:
+        return {'message': 'Invalid role'}, 400
+
+    RoleMapping.query.filter_by(user_id=user_id).delete()
+    new_role_mapping = RoleMapping(user_id=user_id, role_id=role.id)
+    db.session.add(new_role_mapping)
+    db.session.commit()
+
+    return {'message': 'User role updated', 'user': user.to_dict()}
+
+if __name__ == '__main__':
+    app.run(debug=True)
